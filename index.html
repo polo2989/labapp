@@ -403,34 +403,61 @@ function uid(p){return p+(nxt[p]++);}
 const API_URL='https://script.google.com/macros/s/AKfycbxu5BrebLBAifQZRR9XeLyGp5LQ0ub4Ky-k9txewT9IZeHyx7Bqc1CKOZQsWh3Sgzmx/exec';
 let USE_DEMO=false;
 
-// ── apiCall: resuelve CORS de Apps Script desde GitHub Pages ──
-// Apps Script redirige la petición a una URL de googleusercontent.com
-// que SÍ tiene CORS habilitado. Se necesita Content-Type: text/plain
-// para que no sea una "preflight request" que Apps Script no soporta.
-async function apiCall(accion,params={},body=null){
-  if(USE_DEMO)return demoCall(accion,params,body);
-  try{
-    const qs=new URLSearchParams({accion,...params});
-    const url=API_URL+'?'+qs.toString();
-    let resp;
-    if(body){
-      resp=await fetch(url,{
-        method:'POST',
-        headers:{'Content-Type':'text/plain;charset=utf-8'},
-        body:JSON.stringify(body),
-        redirect:'follow',
-      });
-    } else {
-      resp=await fetch(url,{redirect:'follow'});
+// ── apiCall con JSONP ──────────────────────────────────────────
+// JSONP evita el bloqueo CORS inyectando un <script> en el DOM.
+// Apps Script responde con: callback({...datos...})
+// Para escritura (body != null) usamos JSONP igual pero pasando
+// el body codificado como parámetro GET.
+// ──────────────────────────────────────────────────────────────
+let _jsonpCounter = 0;
+
+function apiCall(accion, params={}, body=null){
+  if(USE_DEMO) return Promise.resolve(demoCall(accion,params,body));
+
+  return new Promise((resolve) => {
+    const cbName = '_gcb_' + (++_jsonpCounter);
+    const timeout = setTimeout(() => {
+      // Timeout: caer a demo sin romper la app
+      cleanup();
+      console.warn('apiCall timeout, usando demo:', accion);
+      resolve(demoCall(accion, params, body));
+    }, 8000);
+
+    function cleanup(){
+      clearTimeout(timeout);
+      delete window[cbName];
+      const el = document.getElementById(cbName);
+      if(el) el.remove();
     }
-    const txt=await resp.text();
-    const d=JSON.parse(txt);
-    if(d&&d.error){console.warn('API:',d.error);return demoCall(accion,params,body);}
-    return d;
-  }catch(err){
-    console.warn('apiCall cayó a demo:',accion,err.message);
-    return demoCall(accion,params,body);
-  }
+
+    window[cbName] = function(data){
+      cleanup();
+      if(data && data.error){
+        console.warn('Apps Script error:', data.error);
+        resolve(demoCall(accion, params, body));
+      } else {
+        resolve(data);
+      }
+    };
+
+    // Construir URL con todos los parámetros
+    const qp = { accion, callback: cbName, ...params };
+    if(body) qp.body = encodeURIComponent(JSON.stringify(body));
+
+    const qs = Object.entries(qp).map(([k,v])=>
+      encodeURIComponent(k)+'='+encodeURIComponent(v)
+    ).join('&');
+
+    const script = document.createElement('script');
+    script.id = cbName;
+    script.src = API_URL + '?' + qs;
+    script.onerror = function(){
+      cleanup();
+      console.warn('apiCall JSONP error, usando demo:', accion);
+      resolve(demoCall(accion, params, body));
+    };
+    document.head.appendChild(script);
+  });
 }
 
 function enrich(s){
