@@ -416,44 +416,56 @@ function apiCall(accion, params={}, body=null){
 
   return new Promise((resolve) => {
     const cbName = '_gcb_' + (++_jsonpCounter);
-    const timeout = setTimeout(() => {
-      // Timeout: caer a demo sin romper la app
+    let resuelto = false;
+
+    const timer = setTimeout(() => {
+      if(resuelto) return;
+      resuelto = true;
       cleanup();
-      console.warn('apiCall timeout, usando demo:', accion);
+      console.warn('apiCall timeout (12s), usando demo:', accion);
       resolve(demoCall(accion, params, body));
-    }, 8000);
+    }, 12000);
 
     function cleanup(){
-      clearTimeout(timeout);
-      delete window[cbName];
+      clearTimeout(timer);
+      // NO borramos window[cbName] inmediatamente — puede llegar
+      // tarde la respuesta y necesita encontrar el callback.
+      // Lo borramos con un pequeño delay.
+      setTimeout(()=>{ delete window[cbName]; }, 2000);
       const el = document.getElementById(cbName);
       if(el) el.remove();
     }
 
     window[cbName] = function(data){
+      if(resuelto) return; // respuesta tardía ignorada
+      resuelto = true;
       cleanup();
       if(data && data.error){
-        console.warn('Apps Script error:', data.error);
-        resolve(demoCall(accion, params, body));
+        console.warn('Apps Script error:', accion, data.error);
+        // Solo caer a demo si es un error de "no encontrado"
+        // Errores de datos reales los propagamos
+        try { resolve(demoCall(accion, params, body)); } catch(e){ resolve({error:data.error}); }
       } else {
         resolve(data);
       }
     };
 
-    // Construir URL con todos los parámetros
-    const qp = { accion, callback: cbName, ...params };
-    if(body) qp.body = encodeURIComponent(JSON.stringify(body));
-
-    const qs = Object.entries(qp).map(([k,v])=>
-      encodeURIComponent(k)+'='+encodeURIComponent(v)
-    ).join('&');
+    // Construir query string manualmente para mayor control
+    let qs = 'accion=' + encodeURIComponent(accion) + '&callback=' + encodeURIComponent(cbName);
+    for(const [k,v] of Object.entries(params)){
+      if(v !== undefined && v !== null && v !== '')
+        qs += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(v);
+    }
+    if(body) qs += '&body=' + encodeURIComponent(JSON.stringify(body));
 
     const script = document.createElement('script');
     script.id = cbName;
     script.src = API_URL + '?' + qs;
     script.onerror = function(){
+      if(resuelto) return;
+      resuelto = true;
       cleanup();
-      console.warn('apiCall JSONP error, usando demo:', accion);
+      console.warn('JSONP error de red, usando demo:', accion);
       resolve(demoCall(accion, params, body));
     };
     document.head.appendChild(script);
@@ -854,7 +866,11 @@ function renderTablaServicios(ss){
       </tr>`).join('')}</tbody>
   </table></div>`);
 }
-function abrirServicio(id){ST.servicioActivo={id};go('detalle-servicio',null);}
+function abrirServicio(id){
+  if(!id){console.warn('abrirServicio: id inválido');return;}
+  ST.servicioActivo={id};
+  go('detalle-servicio',null);
+}
 
 function rNuevoIngreso(){
   ST.wizStep=1;ST.checkin={};ST.clasif={};ST.checkout={};ST.semGrav='v';ST.semUrg='a';
@@ -1359,11 +1375,39 @@ async function guardarTodo(){
   }
 }
 async function rDetalleServicio(){
+  const id=ST.servicioActivo?.id;
+  if(!id){
+    setTop(`<div class="tt"><button class="back" onclick="go('servicios',null)"><i class="fa-solid fa-arrow-left"></i></button> Error</div>`);
+    setC('<div class="card" style="color:var(--danger);padding:20px">No se seleccionó un servicio válido. <button class="btn" onclick="go(\'servicios\',null)">Volver</button></div>');
+    return;
+  }
   setTop(`<div class="tt"><button class="back" onclick="go('servicios',null)"><i class="fa-solid fa-arrow-left"></i></button> Cargando...</div>`);
   setC(spin());
-  const{servicio}=await apiCall('obtener_servicio',{id:ST.servicioActivo.id});
-  ST.servicioActivo=servicio;
-  renderServData(servicio);
+  try{
+    const res=await apiCall('obtener_servicio',{id});
+    const servicio=res?.servicio;
+    if(servicio&&servicio.id){
+      ST.servicioActivo=servicio;
+      renderServData(servicio);
+    } else {
+      // Fallback a datos locales
+      const local=DB.servicios.find(s=>s.id===id);
+      if(local){
+        const e=enrich(local);
+        e.repuestos=DB.repuestos[id]||[];
+        e.historial=[e];
+        ST.servicioActivo=e;
+        renderServData(e);
+      } else {
+        setC('<div class="card" style="color:var(--danger);padding:20px">Servicio no encontrado. <button class="btn" onclick="go(\'servicios\',null)">Volver</button></div>');
+      }
+    }
+  }catch(err){
+    console.error('rDetalleServicio error:',err);
+    const local=DB.servicios.find(s=>s.id===id);
+    if(local){const e=enrich(local);e.repuestos=DB.repuestos[id]||[];ST.servicioActivo=e;renderServData(e);}
+    else setC('<div class="card" style="color:var(--danger);padding:20px">Error cargando servicio. <button class="btn" onclick="go(\'servicios\',null)">Volver</button></div>');
+  }
 }
 function renderServData(s){
   const estados=['Pendiente','En diagnóstico','Esperando repuestos','En reparación','Terminado','Entregado'];
@@ -1660,22 +1704,28 @@ async function guardarDiag(id_servicio){
   setTimeout(()=>{if(st){st.textContent='';st.style.color='';}},4000);
 }
 async function addRep(id_servicio){
+  if(!id_servicio){toast('Error: sin servicio activo','err');return;}
   const nombre=document.getElementById('rn')?.value.trim();
   if(!nombre){toast('Ingresá el nombre del repuesto','err');return;}
   const datos={id_servicio,nombre,qty:parseFloat(document.getElementById('rq')?.value)||1,precio:parseFloat(document.getElementById('rp')?.value)||0,costo:parseFloat(document.getElementById('rc')?.value)||0,prov:document.getElementById('rprov')?.value.trim()};
   await apiCall('agregar_repuesto',{},datos);
   toast('Repuesto agregado','ok');
-  const{servicio}=await apiCall('obtener_servicio',{id:id_servicio});
-  ST.servicioActivo=servicio;sTab('tab-rep',servicio);
+  // Actualizar datos locales y re-renderizar sin nueva llamada a la API
+  if(!DB.repuestos[id_servicio])DB.repuestos[id_servicio]=[];
+  DB.repuestos[id_servicio].push({id:'r'+uid('r'),...datos});
+  const s=ST.servicioActivo;
+  if(s){s.repuestos=DB.repuestos[id_servicio];sTab('tab-rep',s);}
 }
 async function elimRep(id_rep,id_servicio){
   if(!confirm('¿Eliminar este repuesto?'))return;
   await apiCall('eliminar_repuesto',{},{id_detalle:id_rep});
-  const idx=DB.repuestos[id_servicio]?.findIndex(r=>r.id===id_rep);
-  if(idx>=0)DB.repuestos[id_servicio].splice(idx,1);
+  if(DB.repuestos[id_servicio]){
+    const idx=DB.repuestos[id_servicio].findIndex(r=>r.id===id_rep);
+    if(idx>=0)DB.repuestos[id_servicio].splice(idx,1);
+  }
   toast('Repuesto eliminado','ok');
-  const{servicio}=await apiCall('obtener_servicio',{id:id_servicio});
-  ST.servicioActivo=servicio;sTab('tab-rep',servicio);
+  const s=ST.servicioActivo;
+  if(s){s.repuestos=DB.repuestos[id_servicio]||[];sTab('tab-rep',s);}
 }
 
 // ---- Adjuntos de repuestos ----
